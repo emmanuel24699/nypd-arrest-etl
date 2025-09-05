@@ -5,6 +5,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import os
 import logging
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Configure logging
 logging.basicConfig(
@@ -28,7 +30,7 @@ def get_db_connection():
         load_dotenv()
         conn = psycopg2.connect(
             os.getenv("DATABASE_URL"),
-            sslmode="require"  # Required for Neon
+            sslmode="require"
         )
         logger.info("Database connection established.")
         return conn
@@ -41,7 +43,7 @@ def get_last_date():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT MAX(arrest_date) FROM public.arrests;")
+        cur.execute("SELECT MAX(arrest_date) FROM nypd_arrests;")
         result = cur.fetchone()[0]
         conn.close()
         if result:
@@ -51,7 +53,22 @@ def get_last_date():
         return None
     except Exception as e:
         logger.error(f"Error querying last arrest_date: {e}")
-        return None  # Handle table not existing
+        return None
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type(requests.exceptions.RequestException)
+)
+def fetch_batch(params):
+    """Fetch a single batch from the API with retry logic."""
+    try:
+        response = requests.get(API_URL, params=params, timeout=15)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {e}")
+        raise
 
 def extract_data(last_date=None):
     """
@@ -62,38 +79,49 @@ def extract_data(last_date=None):
     offset = 0
     params = {
         '$limit': BATCH_SIZE,
-        '$order': 'arrest_date ASC'  # Ensure consistent ordering
+        '$order': 'arrest_date ASC'
     }
 
     if last_date:
         params['$where'] = f"arrest_date > '{last_date.strftime('%Y-%m-%d')}'"
 
+    # Load existing data if file exists
+    if os.path.exists(OUTPUT_PATH):
+        try:
+            with open(OUTPUT_PATH, 'r') as f:
+                data = json.load(f)
+            logger.info(f"Loaded {len(data)} existing records from {OUTPUT_PATH}")
+        except Exception as e:
+            logger.warning(f"Failed to load existing data: {e}; starting fresh")
+
     while True:
         params['$offset'] = offset
         try:
             logger.info(f"Fetching batch: offset={offset}")
-            response = requests.get(API_URL, params=params, timeout=10)
-            response.raise_for_status()
-            batch = response.json()
+            batch = fetch_batch(params)
             if not batch:
                 logger.info("No more data to fetch.")
                 break
             data.extend(batch)
             offset += BATCH_SIZE
             logger.info(f"Fetched {len(batch)} records, total so far: {len(data)}")
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            raise
 
-    # Save raw data to file
-    try:
-        os.makedirs('data', exist_ok=True)
-        with open(OUTPUT_PATH, 'w') as f:
-            json.dump(data, f, indent=2)
-        logger.info(f"Saved {len(data)} records to {OUTPUT_PATH}")
-    except Exception as e:
-        logger.error(f"Failed to save data: {e}")
-        raise
+            # Save incrementally
+            try:
+                os.makedirs('data', exist_ok=True)
+                with open(OUTPUT_PATH, 'w') as f:
+                    json.dump(data, f, indent=2)
+                logger.info(f"Saved {len(data)} records to {OUTPUT_PATH}")
+            except Exception as e:
+                logger.error(f"Failed to save data: {e}")
+                raise
+
+            # Delay to avoid overwhelming API
+            time.sleep(1)
+
+        except requests.RequestException as e:
+            logger.error(f"Retry failed for batch at offset {offset}: {e}")
+            raise
 
     return data
 
