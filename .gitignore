@@ -143,6 +143,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env *.env
+
 
 # Spyder project settings
 .spyderproject
@@ -205,3 +207,27 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+Python
+
+*.pyc pycache/ *.pyo *.pyd .Python env/ venv/ ENV/ env.bak/ venv.bak/
+
+Environment variables
+
+.env *.env
+
+Data and temporary files
+
+data/* !data/.gitkeep
+
+IDEs and editors
+
+.vscode/ .idea/ *.sublime-project *.sublime-workspace
+
+OS generated files
+
+.DS_Store Thumbs.db
+
+Logs
+
+*.log
