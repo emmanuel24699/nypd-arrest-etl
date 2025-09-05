@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 API_URL = "https://data.cityofnewyork.us/resource/8h9b-rp9u.json"
-BATCH_SIZE = 1000
+BATCH_SIZE = 50000  # SODA 2.0 max limit
 OUTPUT_PATH = "data/raw_data.json"
 
 def get_db_connection():
@@ -72,7 +72,7 @@ def fetch_batch(params):
 
 def extract_data(last_date=None):
     """
-    Extract data from NYC Open Data API.
+    Extract data from NYC Open Data API using SODA 2.0.
     If last_date is provided, fetch records after that date.
     """
     data = []
