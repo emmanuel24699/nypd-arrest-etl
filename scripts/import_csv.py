@@ -16,33 +16,37 @@ logger = logging.getLogger(__name__)
 # Constants
 CSV_PATH = "data/nypd_arrests_historic.csv"
 OUTPUT_PATH = "data/raw_data.json"
-CHUNK_SIZE = 100000
+CHUNK_SIZE = 50000
 
 def import_csv():
-    """Import NYPD Arrest Data from CSV and save as JSON Lines."""
+    """Import CSV data and save as JSON Lines."""
     try:
         if not os.path.exists(CSV_PATH):
             logger.error(f"CSV file {CSV_PATH} does not exist")
             raise FileNotFoundError(f"{CSV_PATH} not found")
 
-        data = []
-        logger.info(f"Reading CSV from {CSV_PATH}")
-        for chunk in pd.read_csv(CSV_PATH, chunksize=CHUNK_SIZE):
-            # Convert chunk to list of dicts
-            chunk_data = chunk.to_dict('records')
-            data.extend(chunk_data)
-            logger.info(f"Processed chunk: {len(chunk)} records, total so far: {len(data)}")
+        os.makedirs('data', exist_ok=True)
+        with open(OUTPUT_PATH, 'w') as f:
+            f.write('')
 
-        # Save as JSON Lines
-        try:
-            os.makedirs('data', exist_ok=True)
-            pd.DataFrame(data).to_json(OUTPUT_PATH, orient='records', lines=True)
-            logger.info(f"Saved {len(data)} records to {OUTPUT_PATH}")
-        except Exception as e:
-            logger.error(f"Failed to save JSON: {e}")
-            raise
+        total_records = 0
+        for chunk in pd.read_csv(CSV_PATH, chunksize=CHUNK_SIZE, low_memory=False):
+            logger.info(f"Processing chunk: {len(chunk)} records")
+            logger.info(f"Chunk columns: {list(chunk.columns)}")
 
-        return data
+            required_columns = ['arrest_key', 'arrest_date']
+            missing_columns = [col for col in required_columns if col not in chunk.columns]
+            if missing_columns:
+                logger.error(f"Missing required columns: {missing_columns}")
+                raise ValueError(f"Missing columns: {missing_columns}")
+
+            with open(OUTPUT_PATH, 'a') as f:
+                chunk.to_json(f, orient='records', lines=True, index=False)
+            total_records += len(chunk)
+            logger.info(f"Appended {len(chunk)} records to {OUTPUT_PATH}, total: {total_records}")
+
+        logger.info(f"CSV import complete. Total records: {total_records}")
+        return [{'total_records': total_records}]
 
     except Exception as e:
         logger.error(f"CSV import failed: {e}")
@@ -51,9 +55,9 @@ def import_csv():
 def main():
     """Main function to run the CSV import process."""
     try:
-        data = import_csv()
-        logger.info(f"CSV import complete. Total records: {len(data)}")
-        return data
+        imported_data = import_csv()
+        logger.info(f"CSV import complete. Total records: {imported_data[0]['total_records']}")
+        return imported_data
     except Exception as e:
         logger.error(f"CSV import failed: {e}")
         raise

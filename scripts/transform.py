@@ -33,7 +33,7 @@ LAW_CAT_CD_MAPPING = {
     'NONE': 'U',  # Invalid values to Unknown
     None: 'U'     # Missing values to Unknown
 }
-CHUNK_SIZE = 50000
+CHUNK_SIZE = 100000
 
 def convert_timestamp(value):
     """Convert Unix timestamp (milliseconds) to YYYY-MM-DD string."""

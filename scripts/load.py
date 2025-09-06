@@ -4,6 +4,7 @@ import logging
 from dotenv import load_dotenv
 import os
 from io import StringIO
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Configure logging
 logging.basicConfig(
@@ -18,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 INPUT_PATH = "data/transformed_data.json"
-CHUNK_SIZE = 50000  # Match extract batch size
-TEMP_TABLE = "temp_nypd_arrests"
+CHUNK_SIZE = 100000
+TEMP_TABLE = "nypd_arrests_temp"
 
 def get_db_connection():
     """Establish database connection using DATABASE_URL from .env."""
@@ -35,11 +36,23 @@ def get_db_connection():
         logger.error(f"Failed to connect to database: {e}")
         raise
 
+def check_connection(conn):
+    """Check if connection is open; reconnect if closed."""
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        logger.warning(f"Connection closed: {e}. Reconnecting...")
+        conn.close()
+        return get_db_connection()
+
 def create_temp_table(conn):
-    """Create a temporary table for bulk loading, dropping it if it exists."""
+    """Create a regular table for bulk loading, dropping it if it exists."""
     create_query = f"""
     DROP TABLE IF EXISTS {TEMP_TABLE};
-    CREATE TEMP TABLE {TEMP_TABLE} (
+    CREATE TABLE {TEMP_TABLE} (
         arrest_key VARCHAR,
         arrest_date DATE,
         pd_cd VARCHAR,
@@ -64,12 +77,38 @@ def create_temp_table(conn):
         cur = conn.cursor()
         cur.execute(create_query)
         conn.commit()
-        logger.info(f"Temporary table {TEMP_TABLE} created.")
+        logger.info(f"Table {TEMP_TABLE} created.")
         cur.close()
     except Exception as e:
-        logger.error(f"Failed to create temporary table: {e}")
+        logger.error(f"Failed to create table: {e}")
         raise
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.InterfaceError))
+)
+def copy_chunk_to_table(conn, buffer, columns):
+    """Copy chunk to table with retry logic."""
+    try:
+        cur = conn.cursor()
+        cur.copy_expert(
+            f"COPY {TEMP_TABLE} ({','.join(columns)}) FROM STDIN WITH (FORMAT CSV, DELIMITER '\t', NULL '')",
+            buffer
+        )
+        conn.commit()
+        logger.info(f"Copied {buffer.getvalue().count('\n')} records to table")
+        cur.close()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to copy chunk to table: {e}")
+        raise
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((psycopg2.OperationalError, psycopg2.InterfaceError))
+)
 def merge_into_main_table(conn):
     """Merge data from temporary table to nypd_arrests with ON CONFLICT and normalization."""
     merge_query = f"""
@@ -115,15 +154,14 @@ def merge_into_main_table(conn):
         cur.close()
         return inserted
     except Exception as e:
+        conn.rollback()
         logger.error(f"Failed to merge data: {e}")
         raise
 
 def chunk_to_stringio(chunk):
     """Convert a DataFrame chunk to a tab-delimited StringIO buffer."""
     buffer = StringIO()
-    # Replace None/NaN with empty string for COPY
     chunk = chunk.fillna('')
-    # Convert to tab-delimited string
     chunk.to_csv(buffer, sep='\t', index=False, header=False, na_rep='')
     buffer.seek(0)
     return buffer
@@ -131,20 +169,16 @@ def chunk_to_stringio(chunk):
 def load_data():
     """Load transformed data into nypd_arrests table using COPY with StringIO."""
     try:
-        # Read transformed data
         logger.info(f"Reading transformed data from {INPUT_PATH}")
         if not os.path.exists(INPUT_PATH):
             logger.error(f"Input file {INPUT_PATH} does not exist")
             raise FileNotFoundError(f"{INPUT_PATH} not found")
 
-        # Connect to database
         conn = get_db_connection()
         total_inserted = 0
 
-        # Create temporary table
         create_temp_table(conn)
 
-        # Define columns for COPY
         columns = [
             'arrest_key', 'arrest_date', 'pd_cd', 'pd_desc', 'ky_cd', 'ofns_desc',
             'law_code', 'law_cat_cd', 'arrest_boro', 'arrest_precinct',
@@ -152,48 +186,36 @@ def load_data():
             'x_coord_cd', 'y_coord_cd', 'latitude', 'longitude'
         ]
 
-        # Read JSON Lines in chunks
         for chunk in pd.read_json(INPUT_PATH, chunksize=CHUNK_SIZE, lines=True):
             logger.info(f"Processing chunk: {len(chunk)} records")
 
-            # Ensure correct column order and handle missing columns
             chunk = chunk.reindex(columns=columns, fill_value='')
 
-            # Convert chunk to StringIO
             buffer = chunk_to_stringio(chunk)
 
-            # Load into temporary table using COPY
+            # Check and reconnect if necessary
+            conn = check_connection(conn)
+
             try:
-                cur = conn.cursor()
-                cur.copy_expert(
-                    f"COPY {TEMP_TABLE} ({','.join(columns)}) FROM STDIN WITH (FORMAT CSV, DELIMITER '\t', NULL '')",
-                    buffer
-                )
-                conn.commit()
-                logger.info(f"Copied {len(chunk)} records to temporary table")
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Failed to copy chunk to temporary table: {e}")
-                raise
+                copy_chunk_to_table(conn, buffer, columns)
             finally:
                 buffer.close()
 
-            # Merge into main table
+            conn = check_connection(conn)
             inserted = merge_into_main_table(conn)
             total_inserted += inserted
 
-            # Drop temporary table to free memory
             try:
                 cur = conn.cursor()
                 cur.execute(f"DROP TABLE IF EXISTS {TEMP_TABLE};")
                 conn.commit()
-                logger.info(f"Dropped temporary table {TEMP_TABLE}")
+                logger.info(f"Dropped table {TEMP_TABLE}")
                 cur.close()
             except Exception as e:
-                logger.error(f"Failed to drop temporary table: {e}")
+                logger.error(f"Failed to drop table: {e}")
                 raise
 
-            # Recreate temporary table for next chunk
+            conn = check_connection(conn)
             create_temp_table(conn)
 
         conn.close()
@@ -203,6 +225,10 @@ def load_data():
     except Exception as e:
         logger.error(f"Loading failed: {e}")
         raise
+    finally:
+        if 'conn' in locals() and not conn.closed:
+            conn.close()
+            logger.info("Database connection closed.")
 
 def main():
     """Main function to run the loading process."""

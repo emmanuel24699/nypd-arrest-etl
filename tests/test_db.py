@@ -8,10 +8,10 @@ def test_connection():
         # Neon provides a single DATABASE_URL
         conn = psycopg2.connect(
             os.getenv("DATABASE_URL"),
-            sslmode="require"   # Required for Neon
+            sslmode="require"  
         )
         cur = conn.cursor()
-        cur.execute("SELECT 'Neon connection successful!'")
+        cur.execute("SELECT 'DB connection successful!'")
         result = cur.fetchone()
         print(result[0])
         conn.close()
