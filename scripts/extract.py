@@ -1,7 +1,8 @@
 import requests
-import json
+import pandas as pd
 import psycopg2
 from datetime import datetime
+import json
 from dotenv import load_dotenv
 import os
 import logging
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 API_URL = "https://data.cityofnewyork.us/resource/8h9b-rp9u.json"
 BATCH_SIZE = 50000  # SODA 2.0 max limit
 OUTPUT_PATH = "data/raw_data.json"
+CHECKPOINT_PATH = "data/extract_checkpoint.json"
 
 def get_db_connection():
     """Establish database connection using DATABASE_URL from .env."""
@@ -56,8 +58,8 @@ def get_last_date():
         return None
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=4, max=20),
     retry=retry_if_exception_type(requests.exceptions.RequestException)
 )
 def fetch_batch(params):
@@ -70,13 +72,38 @@ def fetch_batch(params):
         logger.error(f"API request failed: {e}")
         raise
 
+def save_checkpoint(offset):
+    """Save checkpoint with current offset."""
+    try:
+        checkpoint = {"last_offset": offset}
+        os.makedirs('data', exist_ok=True)
+        with open(CHECKPOINT_PATH, 'w') as f:
+            json.dump(checkpoint, f)
+        logger.info(f"Saved checkpoint at offset {offset}")
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint: {e}")
+        raise
+
+def load_checkpoint():
+    """Load checkpoint if exists."""
+    if os.path.exists(CHECKPOINT_PATH):
+        try:
+            with open(CHECKPOINT_PATH, 'r') as f:
+                checkpoint = json.load(f)
+            logger.info(f"Loaded checkpoint: last_offset={checkpoint['last_offset']}")
+            return checkpoint['last_offset'], []
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}; starting fresh")
+    return 0, []
+
 def extract_data(last_date=None):
     """
     Extract data from NYC Open Data API using SODA 2.0.
     If last_date is provided, fetch records after that date.
     """
-    data = []
-    offset = 0
+    # Load checkpoint or start fresh
+    offset, data = load_checkpoint()
+    
     params = {
         '$limit': BATCH_SIZE,
         '$order': 'arrest_date ASC'
@@ -85,14 +112,11 @@ def extract_data(last_date=None):
     if last_date:
         params['$where'] = f"arrest_date > '{last_date.strftime('%Y-%m-%d')}'"
 
-    # Load existing data if file exists
-    if os.path.exists(OUTPUT_PATH):
-        try:
-            with open(OUTPUT_PATH, 'r') as f:
-                data = json.load(f)
-            logger.info(f"Loaded {len(data)} existing records from {OUTPUT_PATH}")
-        except Exception as e:
-            logger.warning(f"Failed to load existing data: {e}; starting fresh")
+    # Initialize JSON Lines file
+    os.makedirs('data', exist_ok=True)
+    if offset == 0:
+        with open(OUTPUT_PATH, 'w') as f:
+            f.write('')  # Clear file for fresh start
 
     while True:
         params['$offset'] = offset
@@ -102,26 +126,40 @@ def extract_data(last_date=None):
             if not batch:
                 logger.info("No more data to fetch.")
                 break
+
+            # Validate batch
+            df = pd.DataFrame(batch)
+            if 'arrest_key' not in df.columns or 'arrest_date' not in df.columns:
+                missing = [col for col in ['arrest_key', 'arrest_date'] if col not in df.columns]
+                logger.error(f"Missing required columns {missing} in batch at offset {offset}")
+                raise ValueError(f"Missing required columns: {missing}")
+            logger.info(f"Batch columns: {list(df.columns)}")
+
             data.extend(batch)
             offset += BATCH_SIZE
             logger.info(f"Fetched {len(batch)} records, total so far: {len(data)}")
 
-            # Save incrementally
+            # Append batch to JSON Lines file
             try:
-                os.makedirs('data', exist_ok=True)
-                with open(OUTPUT_PATH, 'w') as f:
-                    json.dump(data, f, indent=2)
-                logger.info(f"Saved {len(data)} records to {OUTPUT_PATH}")
+                with open(OUTPUT_PATH, 'a') as f:
+                    df.to_json(f, orient='records', lines=True, index=False)
+                logger.info(f"Appended {len(batch)} records to {OUTPUT_PATH}")
+                save_checkpoint(offset)
             except Exception as e:
-                logger.error(f"Failed to save data: {e}")
+                logger.error(f"Failed to save batch: {e}")
                 raise
 
             # Delay to avoid overwhelming API
-            time.sleep(1)
+            time.sleep(2)
 
         except requests.RequestException as e:
             logger.error(f"Retry failed for batch at offset {offset}: {e}")
             raise
+
+    # Clear checkpoint after successful completion
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+        logger.info("Cleared checkpoint after successful extraction")
 
     return data
 

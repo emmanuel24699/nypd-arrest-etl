@@ -1,23 +1,58 @@
 name: NYPD Arrest Data ETL
+
+# Define triggers: weekly schedule and manual dispatch
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight UTC
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 1 * * 1'  # Run every Monday at 1 AM UTC
+  workflow_dispatch:  # Allow manual triggering
+
 jobs:
   etl:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      # Checkout the repository
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      # Set up Python 3.13
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      # Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Create data directory
+      - name: Create data directory
+        run: mkdir -p data
+
+      # Run ETL pipeline with API (USE_CSV=false)
       - name: Run ETL pipeline
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          USE_CSV: 'false'
         run: python scripts/etl.py
+        continue-on-error: false
+
+      # Upload logs as artifacts
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-logs
+          path: |
+            data/extract.log
+            data/transform.log
+            data/load.log
+            data/etl.log
+          retention-days: 7
+
+      # Notify on failure (optional, using GitHub Actions logging)
+      - name: Notify on failure
+        if: failure()
+        run: echo "ETL pipeline failed. Check logs for details."

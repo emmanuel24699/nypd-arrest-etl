@@ -1,8 +1,7 @@
 import pandas as pd
-import json
 import logging
-from datetime import datetime
 import os
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -18,111 +17,159 @@ logger = logging.getLogger(__name__)
 # Constants
 INPUT_PATH = "data/raw_data.json"
 OUTPUT_PATH = "data/transformed_data.json"
+BOROUGH_MAPPING = {
+    'B': 'Bronx',
+    'K': 'Brooklyn',
+    'M': 'Manhattan',
+    'Q': 'Queens',
+    'S': 'Staten Island'
+}
+LAW_CAT_CD_MAPPING = {
+    'F': 'F',  # Felony
+    'M': 'M',  # Misdemeanor
+    'V': 'V',  # Violation
+    'I': 'I',  # Infraction (less common, but valid in some datasets)
+    '': 'U',   # Empty string to Unknown
+    'NONE': 'U',  # Invalid values to Unknown
+    None: 'U'     # Missing values to Unknown
+}
+CHUNK_SIZE = 50000
+
+def convert_timestamp(value):
+    """Convert Unix timestamp (milliseconds) to YYYY-MM-DD string."""
+    try:
+        # Try converting as a numeric timestamp (milliseconds)
+        timestamp = float(value) / 1000  # Convert milliseconds to seconds
+        dt = pd.to_datetime(timestamp, unit='s', utc=True)
+        return dt.strftime('%Y-%m-%d')
+    except (ValueError, TypeError):
+        return value  # Return original value if conversion fails
 
 def transform_data():
-    """Transform raw NYPD arrest data into a clean format."""
+    """Transform raw data and save as JSON Lines."""
     try:
         # Read raw data
         logger.info(f"Reading raw data from {INPUT_PATH}")
         if not os.path.exists(INPUT_PATH):
             logger.error(f"Input file {INPUT_PATH} does not exist")
             raise FileNotFoundError(f"{INPUT_PATH} not found")
-        
-        with open(INPUT_PATH, 'r') as f:
-            raw_data = json.load(f)
-        
-        logger.info(f"Loaded {len(raw_data)} raw records")
-        df = pd.DataFrame(raw_data)
 
-        # Log initial data shape and columns
-        logger.info(f"Initial DataFrame shape: {df.shape}")
-        logger.info(f"Columns: {list(df.columns)}")
+        # Initialize output file
+        os.makedirs('data', exist_ok=True)
+        with open(OUTPUT_PATH, 'w') as f:
+            f.write('')  # Clear output file
 
-        # Drop nested lon_lat column if present
-        if 'lon_lat' in df.columns:
-            df = df.drop(columns=['lon_lat'])
-            logger.info("Dropped lon_lat column")
+        total_records = 0
+        # Process JSON Lines in chunks
+        for chunk in pd.read_json(INPUT_PATH, chunksize=CHUNK_SIZE, lines=True):
+            logger.info(f"Processing chunk: {len(chunk)} records")
+            logger.info(f"Chunk columns: {list(chunk.columns)}")
 
-        # 1. Check for missing critical fields before dropping
-        missing_key = df['arrest_key'].isna() | (df['arrest_key'] == '')
-        missing_date = df['arrest_date'].isna() | (df['arrest_date'] == '')
-        missing_rows = df[missing_key | missing_date]
-        if not missing_rows.empty:
-            logger.warning(f"Found {len(missing_rows)} rows with missing arrest_key or arrest_date")
-            for idx, row in missing_rows.head(5).iterrows():  # Log up to 5 examples
-                logger.warning(f"Missing data in row {idx}: arrest_key={row.get('arrest_key', 'N/A')}, arrest_date={row.get('arrest_date', 'N/A')}")
+            # Rename columns to match expected names (case-insensitive)
+            column_mapping = {col.lower(): col for col in chunk.columns}
+            expected_columns = ['arrest_key', 'arrest_date']
+            for col in expected_columns:
+                if col not in chunk.columns and col.upper() in chunk.columns:
+                    chunk = chunk.rename(columns={col.upper(): col})
+                elif col not in chunk.columns:
+                    logger.warning(f"Missing column {col} in chunk; filling with empty strings")
+                    chunk[col] = ''
 
-        # Drop rows with missing or empty critical fields
-        initial_rows = df.shape[0]
-        df = df[~(missing_key | missing_date)]
-        logger.info(f"Dropped {initial_rows - df.shape[0]} rows with missing or empty arrest_key or arrest_date")
+            # Convert columns to string where .str operations are used
+            str_columns = ['arrest_key', 'arrest_date', 'pd_cd', 'pd_desc', 'ky_cd', 
+                          'ofns_desc', 'law_code', 'law_cat_cd', 'arrest_boro', 
+                          'jurisdiction_code', 'age_group', 'perp_sex', 'perp_race', 
+                          'x_coord_cd', 'y_coord_cd']
+            for col in str_columns:
+                if col in chunk.columns:
+                    chunk[col] = chunk[col].astype(str).replace('nan', '')
 
-        # 2. Convert data types
-        try:
-            df['arrest_date'] = pd.to_datetime(df['arrest_date'], format='ISO8601', errors='coerce')
-            df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-            df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-            df['arrest_precinct'] = pd.to_numeric(df['arrest_precinct'], errors='coerce')
-            logger.info("Converted data types for arrest_date, latitude, longitude, arrest_precinct")
-        except Exception as e:
-            logger.error(f"Error converting data types: {e}")
-            raise
+            # Normalize law_cat_cd to single character
+            if 'law_cat_cd' in chunk.columns:
+                chunk['law_cat_cd'] = chunk['law_cat_cd'].apply(
+                    lambda x: LAW_CAT_CD_MAPPING.get(x.upper() if isinstance(x, str) else x, 'U')
+                )
+                logger.info("Normalized law_cat_cd to single character")
 
-        # 3. Handle missing values
-        # Fill nullable fields with defaults
-        df['pd_cd'] = df['pd_cd'].fillna('UNKNOWN')
-        df['pd_desc'] = df['pd_desc'].fillna('UNKNOWN')
-        df['ky_cd'] = df['ky_cd'].fillna('UNKNOWN')
-        df['ofns_desc'] = df['ofns_desc'].fillna('UNKNOWN')
-        df['law_code'] = df['law_code'].fillna('UNKNOWN')
-        df['law_cat_cd'] = df['law_cat_cd'].fillna('U')
-        df['arrest_boro'] = df['arrest_boro'].fillna('U')
-        df['arrest_precinct'] = df['arrest_precinct'].fillna(-1)
-        df['age_group'] = df['age_group'].fillna('UNKNOWN')
-        df['perp_sex'] = df['perp_sex'].fillna('U')
-        df['perp_race'] = df['perp_race'].fillna('UNKNOWN')
-        df['latitude'] = df['latitude'].fillna(0.0)
-        df['longitude'] = df['longitude'].fillna(0.0)
-        df['x_coord_cd'] = df['x_coord_cd'].fillna('UNKNOWN')
-        df['y_coord_cd'] = df['y_coord_cd'].fillna('UNKNOWN')
-        logger.info("Filled missing values with defaults")
+            # Drop lon_lat column if it exists
+            if 'lon_lat' in chunk.columns:
+                chunk = chunk.drop(columns=['lon_lat'])
+                logger.info("Dropped lon_lat column")
 
-        # 4. Normalize data
-        boro_map = {
-            'K': 'Brooklyn',
-            'M': 'Manhattan',
-            'B': 'Bronx',
-            'Q': 'Queens',
-            'S': 'Staten Island',
-            'U': 'Unknown'
-        }
-        df['arrest_boro'] = df['arrest_boro'].map(boro_map).fillna('Unknown')
-        for col in ['pd_desc', 'ofns_desc', 'law_code', 'age_group', 'perp_race']:
-            df[col] = df[col].str.upper()
-        df['law_cat_cd'] = df['law_cat_cd'].str.upper()
-        df['perp_sex'] = df['perp_sex'].str.upper()
-        logger.info("Normalized borough codes and uppercased categorical fields")
+            # Drop rows with missing or empty arrest_key or arrest_date
+            initial_rows = len(chunk)
+            chunk = chunk.dropna(subset=['arrest_key', 'arrest_date'])
+            chunk = chunk[chunk['arrest_key'].str.strip() != '']
+            chunk = chunk[chunk['arrest_date'].str.strip() != '']
+            logger.info(f"Dropped {initial_rows - len(chunk)} rows with missing or empty arrest_key or arrest_date")
 
-        # 5. Handle duplicates
-        if df['arrest_key'].duplicated().any():
-            logger.warning("Found duplicate arrest_key values; removing duplicates")
-            df = df.drop_duplicates(subset='arrest_key', keep='first')
+            # Convert arrest_date to datetime, handling timestamps
+            try:
+                # First try standard datetime conversion
+                chunk['arrest_date'] = pd.to_datetime(chunk['arrest_date'], errors='coerce')
+                # For remaining NaT values, try converting as Unix timestamps
+                mask = chunk['arrest_date'].isna()
+                if mask.any():
+                    chunk.loc[mask, 'arrest_date'] = chunk.loc[mask, 'arrest_date'].apply(convert_timestamp)
+                    # Retry datetime conversion after timestamp handling
+                    chunk['arrest_date'] = pd.to_datetime(chunk['arrest_date'], errors='coerce')
+                # Format as YYYY-MM-DD for PostgreSQL
+                chunk['arrest_date'] = chunk['arrest_date'].dt.strftime('%Y-%m-%d')
+                logger.info("Converted and formatted arrest_date to YYYY-MM-DD")
+                
+                # Convert numeric columns
+                chunk['latitude'] = pd.to_numeric(chunk['latitude'], errors='coerce')
+                chunk['longitude'] = pd.to_numeric(chunk['longitude'], errors='coerce')
+                chunk['arrest_precinct'] = pd.to_numeric(chunk['arrest_precinct'], errors='coerce', downcast='integer')
+                logger.info("Converted data types for latitude, longitude, arrest_precinct")
+            except Exception as e:
+                logger.error(f"Data type conversion failed: {e}")
+                raise
 
-        # 6. Log final data shape
-        logger.info(f"Final DataFrame shape: {df.shape}")
+            # Fill missing values
+            chunk['pd_cd'] = chunk['pd_cd'].fillna('UNKNOWN')
+            chunk['pd_desc'] = chunk['pd_desc'].fillna('UNKNOWN')
+            chunk['ky_cd'] = chunk['ky_cd'].fillna('UNKNOWN')
+            chunk['ofns_desc'] = chunk['ofns_desc'].fillna('UNKNOWN')
+            chunk['law_code'] = chunk['law_code'].fillna('UNKNOWN')
+            chunk['law_cat_cd'] = chunk['law_cat_cd'].fillna('U')
+            chunk['arrest_boro'] = chunk['arrest_boro'].fillna('Unknown')
+            chunk['arrest_precinct'] = chunk['arrest_precinct'].fillna(-1)
+            chunk['jurisdiction_code'] = chunk['jurisdiction_code'].fillna('UNKNOWN')
+            chunk['age_group'] = chunk['age_group'].fillna('UNKNOWN')
+            chunk['perp_sex'] = chunk['perp_sex'].fillna('U')
+            chunk['perp_race'] = chunk['perp_race'].fillna('UNKNOWN')
+            chunk['x_coord_cd'] = chunk['x_coord_cd'].fillna('UNKNOWN')
+            chunk['y_coord_cd'] = chunk['y_coord_cd'].fillna('UNKNOWN')
+            chunk['latitude'] = chunk['latitude'].fillna(0.0)
+            chunk['longitude'] = chunk['longitude'].fillna(0.0)
+            logger.info("Filled missing values with defaults")
 
-        # 7. Save transformed data
-        transformed_data = df.to_dict('records')
-        try:
-            os.makedirs('data', exist_ok=True)
-            with open(OUTPUT_PATH, 'w') as f:
-                json.dump(transformed_data, f, indent=2, default=str)
-            logger.info(f"Saved {len(transformed_data)} transformed records to {OUTPUT_PATH}")
-        except Exception as e:
-            logger.error(f"Failed to save transformed data: {e}")
-            raise
+            # Normalize borough codes
+            chunk['arrest_boro'] = chunk['arrest_boro'].map(BOROUGH_MAPPING).fillna(chunk['arrest_boro'])
+            logger.info("Normalized borough codes")
 
-        return transformed_data
+            # Uppercase categorical fields
+            categorical_columns = ['pd_cd', 'pd_desc', 'ky_cd', 'ofns_desc', 'law_code', 
+                                  'law_cat_cd', 'arrest_boro', 'jurisdiction_code', 
+                                  'age_group', 'perp_sex', 'perp_race']
+            for col in categorical_columns:
+                if col in chunk.columns:
+                    chunk[col] = chunk[col].str.upper()
+            logger.info("Uppercased categorical fields")
+
+            # Append to JSON Lines output
+            try:
+                with open(OUTPUT_PATH, 'a') as f:
+                    chunk.to_json(f, orient='records', lines=True, index=False)
+                total_records += len(chunk)
+                logger.info(f"Appended {len(chunk)} transformed records to {OUTPUT_PATH}, total: {total_records}")
+            except Exception as e:
+                logger.error(f"Failed to save transformed chunk: {e}")
+                raise
+
+        logger.info(f"Transformation complete. Total records: {total_records}")
+        return [{'total_records': total_records}]
 
     except Exception as e:
         logger.error(f"Transformation failed: {e}")
@@ -132,7 +179,7 @@ def main():
     """Main function to run the transformation process."""
     try:
         transformed_data = transform_data()
-        logger.info(f"Transformation complete. Total records: {len(transformed_data)}")
+        logger.info(f"Transformation complete. Total records: {transformed_data[0]['total_records']}")
         return transformed_data
     except Exception as e:
         logger.error(f"Transformation failed: {e}")
